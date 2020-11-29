@@ -128,7 +128,12 @@ def get_season_team(season_team):
         'score_home': 'score_home',
         'score_away': 'score_away'}
 
-    df = df[columns.keys()].rename(columns=columns)
+    df = df[
+        columns.keys()
+    ].rename(
+        columns=columns
+    ).drop_duplicates(
+        subset=['date', 'team_home', 'team_away'])
 
     df.to_pickle(cachefile)
 
@@ -147,6 +152,7 @@ def concatenate_games(season_team_tuples):
     df = pd.concat(
         df_list, axis=0
     ).drop_duplicates(
+        subset=['date', 'team_home', 'team_away']
     ).sort_values(
         by=['date', 'team_away', 'team_home']
     ).reset_index(drop=True)
