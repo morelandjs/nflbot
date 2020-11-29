@@ -8,7 +8,7 @@ Quick start
 
 Install the project requirements with pip::
 
-   pip3 install requirements.txt
+   pip3 install -r requirements.txt
 
 then deploy the prefect workflow::
 
