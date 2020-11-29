@@ -1,0 +1,7 @@
+hyperopt
+numpy
+pandas
+prefect
+scipy
+sportsreference
+elora @ git+https://git@github.com/morelandjs/elora.git@slackbot#egg=elora
