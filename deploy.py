@@ -15,8 +15,9 @@ from hyperopt import fmin, hp, tpe, Trials
 import numpy as np
 import pandas as pd
 import pendulum
+import prefect
 from prefect.schedules import IntervalSchedule
-from prefect import Flow, Parameter, context, task
+from prefect import Flow, Parameter, task
 from sportsreference.nfl.schedule import Schedule as NFLSchedule
 from sportsreference.nfl.teams import Teams as NFLTeams
 
@@ -83,12 +84,11 @@ def iter_product(list1, list2):
     return [(l1, l2) for l1 in list1 for l2 in list2]
 
 
-@task
 def get_season_team(season_team):
     """
     Get all game scores for the specified season and team
     """
-    logger = context.get('logger')
+    logger = prefect.context.get('logger')
 
     season, team = season_team
 
@@ -136,10 +136,14 @@ def get_season_team(season_team):
 
 
 @task
-def concatenate(df_list):
+def concatenate_games(season_team_tuples):
     """
     Concatenate list of dataframes along first axis
     """
+    df_list = [
+            get_season_team(season_team)
+            for season_team in season_team_tuples]
+
     df = pd.concat(
         df_list, axis=0
     ).drop_duplicates(
@@ -187,7 +191,7 @@ def compute_rest_days(games):
 
 
 @task
-def calibrate_model(games, mode, steps=10):
+def calibrate_model(games, mode):
     """
     Optimizes the EloraTeam model hyperparameters. Returns trained model
     instance using calibrated hyperparameters.
@@ -213,7 +217,7 @@ def calibrate_model(games, mode, steps=10):
 
     parameters = fmin(
         calibrate_loc_params, space, algo=tpe.suggest,
-        max_evals=steps, trials=trials, show_progressbar=True)
+        max_evals=200, trials=trials, show_progressbar=True)
 
     kfactor = parameters['kfactor']
     regress_frac = parameters['regress_frac']
@@ -236,9 +240,19 @@ def calibrate_model(games, mode, steps=10):
 
     parameters = fmin(
         calibrate_scale_param, space, algo=tpe.suggest,
-        max_evals=steps, trials=trials, show_progressbar=True)
+        max_evals=50, trials=trials, show_progressbar=True)
 
     scale = parameters['scale']
+
+    logger = prefect.context.get('logger')
+
+    best_fit_params = ' '.join([
+        f'k={kfactor}',
+        f'regress_frac={regress_frac}',
+        f'rest_coeff={rest_coeff}',
+        f'scale={scale}'])
+
+    logger.info(f'best fit params: {best_fit_params}')
 
     elora_team = EloraTeam(
         games, mode, kfactor, regress_frac, rest_coeff, scale=scale)
@@ -247,12 +261,12 @@ def calibrate_model(games, mode, steps=10):
 
 
 @task
-def rank(spread_model, total_model, datetime, slack_webhook):
+def rank(spread_model, total_model, datetime):
     """
     Rank NFL teams at a certain point in time. The rankings are based on all
     available data preceding that moment in time.
     """
-    logger = context.get('logger')
+    logger = prefect.context.get('logger')
     logger.info('Rankings as of {}\n'.format(datetime))
 
     df = pd.DataFrame(
@@ -286,7 +300,8 @@ def rank(spread_model, total_model, datetime, slack_webhook):
         '*against average team on neutral field'])
 
     requests.post(
-        slack_webhook, data=json.dumps({'text': report}),
+        os.getenv('SLACK_WEBHOOK'),
+        data=json.dumps({'text': report}),
         headers={'Content-Type': 'application/json'})
 
     print(report)
@@ -308,14 +323,14 @@ def upcoming_week(games):
 
 
 @task
-def forecast(spread_model, total_model, games, slack_webhook):
+def forecast(spread_model, total_model, games):
     """
     Forecast outcomes for the list of games specified.
     """
     season = games.season.unique().item()
     week = games.week.unique().item()
 
-    logger = context.get('logger')
+    logger = prefect.context.get('logger')
     logger.info(f"Forecast for season {season} week {week}")
 
     report = pd.DataFrame({
@@ -348,8 +363,11 @@ def forecast(spread_model, total_model, games, slack_webhook):
         report.to_string(index=False),
         '```'])
 
+    slack_webhook = os.getenv('SLACK_WEBHOOK')
+
     requests.post(
-        slack_webhook, data=json.dumps({'text': report}),
+        os.getenv('SLACK_WEBHOOK'),
+        data=json.dumps({'text': report}),
         headers={'Content-Type': 'application/json'})
 
     print(report)
@@ -364,15 +382,11 @@ schedule = IntervalSchedule(
 
 with Flow('deploy nfl model predictions', schedule) as flow:
 
-    current_season = Parameter('current_season')
-
-    slack_webhook = Parameter('slack_webhook')
+    current_season = Parameter('current_season', default=2020)
 
     season_team_tuples = iter_product(seasons(current_season), team_names)
 
-    games_list = get_season_team.map(season_team_tuples)
-
-    games = concatenate(games_list)
+    games = concatenate_games(season_team_tuples)
 
     games = compute_rest_days(games)
 
@@ -380,13 +394,13 @@ with Flow('deploy nfl model predictions', schedule) as flow:
 
     total_model = calibrate_model(games, 'total')
 
-    rank(spread_model, total_model, pd.Timestamp.now(), slack_webhook)
+    rank(spread_model, total_model, pd.Timestamp.now())
 
-    forecast(spread_model, total_model, upcoming_week(games), slack_webhook)
+    forecast(spread_model, total_model, upcoming_week(games))
 
 
 if __name__ == '__main__':
 
-    current_season = 2020
-    slack_webhook = os.getenv('SLACK_WEBHOOK')
-    flow.run(current_season=current_season, slack_webhook=slack_webhook)
+    flow.register(project_name='nflbot')
+
+    # flow.run(current_season=2020)
