@@ -10,54 +10,19 @@ import os
 from pathlib import Path
 import requests
 import time
+import urllib
 
-from hyperopt import fmin, hp, tpe, Trials
 import numpy as np
+import optuna
 import pandas as pd
 import pendulum
 import prefect
-from prefect.schedules import IntervalSchedule
 from prefect import Flow, Parameter, task
+from prefect.schedules import IntervalSchedule
 from sportsreference.nfl.schedule import Schedule as NFLSchedule
 from sportsreference.nfl.teams import Teams as NFLTeams
 
 from model import EloraTeam
-
-
-# remap sportsreference abbreviations
-alias = {
-    'ATL': 'ATL',
-    'BUF': 'BUF',
-    'CAR': 'CAR',
-    'CHI': 'CHI',
-    'CIN': 'CIN',
-    'CLE': 'CLE',
-    'CLT': 'IND',
-    'CRD': 'ARI',
-    'DAL': 'DAL',
-    'DEN': 'DEN',
-    'DET': 'DET',
-    'GNB': 'GB',
-    'HTX': 'HOU',
-    'JAX': 'JAX',
-    'KAN': 'KC',
-    'MIA': 'MIA',
-    'MIN': 'MIN',
-    'NOR': 'NO',
-    'NWE': 'NE',
-    'NYG': 'NYG',
-    'NYJ': 'NYJ',
-    'OTI': 'TEN',
-    'PHI': 'PHI',
-    'PIT': 'PIT',
-    'RAI': 'LV',
-    'RAM': 'LAR',
-    'RAV': 'BAL',
-    'SDG': 'LAC',
-    'SEA': 'SEA',
-    'SFO': 'SF',
-    'TAM': 'TB',
-    'WAS': 'WAS'}
 
 
 @task
@@ -84,7 +49,7 @@ def iter_product(list1, list2):
     return [(l1, l2) for l1 in list1 for l2 in list2]
 
 
-def get_season_team(season_team):
+def get_season_team(season_team, current_season):
     """
     Get all game scores for the specified season and team
     """
@@ -94,12 +59,12 @@ def get_season_team(season_team):
 
     logger.info(f'syncing {season} {team}')
 
-    cachedir = Path('~/.local/share/sportsref').expanduser()
+    cachedir = Path('~/.local/share/sportsref/nfl').expanduser()
     cachedir.mkdir(exist_ok=True, parents=True)
 
     cachefile = cachedir / f'{season}_{team}.pkl'
 
-    if cachefile.exists() and season < 2020:
+    if cachefile.exists() and season < current_season:
         return pd.read_pickle(cachefile)
 
     time.sleep(1)  # rate limit requests
@@ -119,7 +84,7 @@ def get_season_team(season_team):
     df['score_away'] = np.where(
         df.location == 'Away', df.points_scored, df.points_allowed)
 
-    columns = {
+    column_aliases = {
         'datetime': 'date',
         'season': 'season',
         'week': 'week',
@@ -128,10 +93,46 @@ def get_season_team(season_team):
         'score_home': 'score_home',
         'score_away': 'score_away'}
 
+    team_aliases = {
+        'ATL': 'ATL',
+        'BUF': 'BUF',
+        'CAR': 'CAR',
+        'CHI': 'CHI',
+        'CIN': 'CIN',
+        'CLE': 'CLE',
+        'CLT': 'IND',
+        'CRD': 'ARI',
+        'DAL': 'DAL',
+        'DEN': 'DEN',
+        'DET': 'DET',
+        'GNB': 'GB',
+        'HTX': 'HOU',
+        'JAX': 'JAX',
+        'KAN': 'KC',
+        'MIA': 'MIA',
+        'MIN': 'MIN',
+        'NOR': 'NO',
+        'NWE': 'NE',
+        'NYG': 'NYG',
+        'NYJ': 'NYJ',
+        'OTI': 'TEN',
+        'PHI': 'PHI',
+        'PIT': 'PIT',
+        'RAI': 'LV',
+        'RAM': 'LAR',
+        'RAV': 'BAL',
+        'SDG': 'LAC',
+        'SEA': 'SEA',
+        'SFO': 'SF',
+        'TAM': 'TB',
+        'WAS': 'WAS'}
+
     df = df[
-        columns.keys()
+        column_aliases.keys()
     ].rename(
-        columns=columns
+        columns=column_aliases
+    ).replace(
+        team_aliases
     ).drop_duplicates(
         subset=['date', 'team_home', 'team_away'])
 
@@ -141,13 +142,18 @@ def get_season_team(season_team):
 
 
 @task
-def concatenate_games(season_team_tuples):
+def concatenate_games(season_team_tuples, current_season):
     """
     Concatenate list of dataframes along first axis
     """
-    df_list = [
-            get_season_team(season_team)
-            for season_team in season_team_tuples]
+    def games_gen(season_team_tuples):
+        for season_team in season_team_tuples:
+            try:
+                yield get_season_team(season_team, current_season)
+            except urllib.error.HTTPError:
+                continue
+
+    df_list = [games for games in games_gen(season_team_tuples)]
 
     df = pd.concat(
         df_list, axis=0
@@ -197,77 +203,46 @@ def compute_rest_days(games):
 
 
 @task
-def calibrate_model(games, mode):
+def calibrate_model(games, mode, n_trials=100, debug=False):
     """
-    Optimizes the EloraTeam model hyperparameters. Returns trained model
-    instance using calibrated hyperparameters.
+    Optimizes and returns elora distribution mean parameters.
     """
+    logger = prefect.context.get('logger')
+    logger.info(f'calibrating {mode} mean parameters')
+
     games = games.dropna(axis=0, how='any').copy()
 
-    limits = {
-        "spread": [
-            ("kfactor",      0.02, 0.12),
-            ("regress_frac",  0.0,  1.0),
-            ("rest_coeff",  -0.50, 0.75)],
-        "total": [
-            ("kfactor",      0.01, 0.07),
-            ("regress_frac",  0.0,  1.0),
-            ("rest_coeff",   -0.5,  0.5)]}
+    def objective(trial):
+        """
+        hyperparameter objective function
+        """
+        kfactor = trial.suggest_uniform('kfactor', 0.01, 0.1)
+        regress_frac = trial.suggest_uniform('regress_frac', 0.0, 1.0)
+        rest_coeff = trial.suggest_uniform('rest_coeff', -0.5, 0.5)
 
-    space = [hp.uniform(*lim) for lim in limits[mode]]
+        elora_team = EloraTeam(games, mode, kfactor, regress_frac, rest_coeff)
 
-    trials = Trials()
+        return elora_team.mean_abs_error
 
-    def calibrate_loc_params(params):
-        return EloraTeam(games, mode, *params).mean_abs_error
+    study = optuna.create_study()
+    study.optimize(objective, n_trials=(n_trials if debug is False else 2))
 
-    parameters = fmin(
-        calibrate_loc_params, space, algo=tpe.suggest,
-        max_evals=200, trials=trials, show_progressbar=True)
+    kfactor = study.best_params['kfactor']
+    regress_frac = study.best_params['regress_frac']
+    rest_coeff = study.best_params['rest_coeff']
 
-    kfactor = parameters['kfactor']
-    regress_frac = parameters['regress_frac']
-    rest_coeff = parameters['rest_coeff']
+    scale = EloraTeam(
+        games, mode, kfactor, regress_frac, rest_coeff
+    ).residuals_.std()
 
-    limits = {
-        "spread": [
-            ("scale", 5., 25.)],
-        "total": [
-            ("scale", 5., 25.)]}
+    logger.info(f'using scale = {scale}')
 
-    space = [hp.uniform(*lim) for lim in limits[mode]]
-
-    trials = Trials()
-
-    def calibrate_scale_param(params):
-        return EloraTeam(
-            games, mode, kfactor, regress_frac, rest_coeff, scale=params[0]
-        ).log_loss
-
-    parameters = fmin(
-        calibrate_scale_param, space, algo=tpe.suggest,
-        max_evals=50, trials=trials, show_progressbar=True)
-
-    scale = parameters['scale']
-
-    logger = prefect.context.get('logger')
-
-    best_fit_params = ' '.join([
-        f'k={kfactor}',
-        f'regress_frac={regress_frac}',
-        f'rest_coeff={rest_coeff}',
-        f'scale={scale}'])
-
-    logger.info(f'best fit params: {best_fit_params}')
-
-    elora_team = EloraTeam(
+    return EloraTeam(
         games, mode, kfactor, regress_frac, rest_coeff, scale=scale)
-
-    return elora_team
 
 
 @task
-def rank(spread_model, total_model, datetime):
+def rank(spread_model, total_model, datetime, debug=False):
     """
     Rank NFL teams at a certain point in time. The rankings are based on all
     available data preceding that moment in time.
@@ -277,16 +252,14 @@ def rank(spread_model, total_model, datetime):
 
     df = pd.DataFrame(
         spread_model.rank(datetime, order_by='mean', reverse=True),
-        columns=['team', 'point spread']
-    ).replace(alias)
+        columns=['team', 'point spread'])
 
     df['point spread'] = df[['point spread']].applymap('{:4.1f}'.format)
     spread_col = '  ' + df['team'] + '  ' + df['point spread']
 
     df = pd.DataFrame(
         total_model.rank(datetime, order_by='mean', reverse=True),
-        columns=['team', 'point total']
-    ).replace(alias)
+        columns=['team', 'point total'])
 
     df['point total'] = df[['point total']].applymap('{:4.1f}'.format)
     total_col = '  ' + df['team'] + '  ' + df['point total']
@@ -305,43 +278,48 @@ def rank(spread_model, total_model, datetime):
         '```',
         '*against average team on neutral field'])
 
-    requests.post(
-        os.getenv('SLACK_WEBHOOK'),
-        data=json.dumps({'text': report}),
-        headers={'Content-Type': 'application/json'})
+    if debug is False:
+        requests.post(
+            os.getenv('SLACK_WEBHOOK'),
+            data=json.dumps({'text': report}),
+            headers={'Content-Type': 'application/json'})
 
     print(report)
 
 
 @task
-def upcoming_week(games):
+def upcoming_games(games, days=7):
     """
     Returns a dataframe of games to be played in the upcoming week
     """
     upcoming_games = games[
         games.score_home.isnull() & games.score_away.isnull()]
 
-    upcoming_week = upcoming_games[
-        (upcoming_games.week == upcoming_games.week.min())
-    ].copy()
+    days_ahead = (upcoming_games.date - pd.Timestamp.now()).dt.days
+    upcoming_games = upcoming_games[(0 <= days_ahead) & (days_ahead < days)]
 
-    return upcoming_week
+    return upcoming_games.copy()
 
 
 @task
-def forecast(spread_model, total_model, games):
+def forecast(spread_model, total_model, games, debug=False):
     """
     Forecast outcomes for the list of games specified.
     """
-    season = games.season.unique().item()
-    week = games.week.unique().item()
+    if games.empty:
+        logger = prefect.context.get('logger')
+        logger.warning('cannot find upcoming game schedule')
+        return
+
+    season = np.squeeze(games.season.unique())
+    week = np.squeeze(games.week.unique())
 
     logger = prefect.context.get('logger')
     logger.info(f"Forecast for season {season} week {week}")
 
     report = pd.DataFrame({
-        "fav": games.team_away.replace(alias),
-        "und": "@" + games.team_home.replace(alias),
+        "fav": games.team_away,
+        "und": "@" + games.team_home,
         "odds": spread_model.sf(
             0, games.date, games.team_away, games.team_home),
         "spread": spread_model.mean(
@@ -369,12 +347,11 @@ def forecast(spread_model, total_model, games):
         report.to_string(index=False),
         '```'])
 
-    slack_webhook = os.getenv('SLACK_WEBHOOK')
-
-    requests.post(
-        os.getenv('SLACK_WEBHOOK'),
-        data=json.dumps({'text': report}),
-        headers={'Content-Type': 'application/json'})
+    if debug is False:
+        requests.post(
+            os.getenv('SLACK_WEBHOOK'),
+            data=json.dumps({'text': report}),
+            headers={'Content-Type': 'application/json'})
 
     print(report)
 
@@ -386,27 +363,36 @@ schedule = IntervalSchedule(
     end_date=pendulum.datetime(2021, 2, 3, 8, 0, tz="America/New_York"))
 
 
-with Flow('deploy nfl model predictions', schedule) as flow:
+# with Flow('deploy nfl model predictions', schedule) as flow:
+with Flow('deploy nfl model predictions') as flow:
 
     current_season = Parameter('current_season', default=2020)
+    debug = Parameter('debug', default=False)
 
     season_team_tuples = iter_product(seasons(current_season), team_names)
 
-    games = concatenate_games(season_team_tuples)
+    games = concatenate_games(season_team_tuples, current_season)
 
     games = compute_rest_days(games)
 
-    spread_model = calibrate_model(games, 'spread')
+    spread_model = calibrate_model(games, 'spread', debug=debug)
 
-    total_model = calibrate_model(games, 'total')
+    total_model = calibrate_model(games, 'total', debug=debug)
 
-    rank(spread_model, total_model, pd.Timestamp.now())
+    rank(spread_model, total_model, pd.Timestamp.now(), debug=debug)
 
-    forecast(spread_model, total_model, upcoming_week(games))
+    forecast(spread_model, total_model, upcoming_games(games), debug=debug)
 
 
 if __name__ == '__main__':
+    import argparse
+    parser = argparse.ArgumentParser(description='Slack NFL predictions bot')
 
-    flow.register(project_name='nflbot')
+    parser.add_argument(
+        '--debug', help='run in debug mode', action='store_true')
+    args = parser.parse_args()
+    kwargs = vars(args)
 
-    # flow.run(current_season=2020)
+    # flow.register(project_name='nflbot')
+
+    flow.run(current_season=2020, **kwargs)

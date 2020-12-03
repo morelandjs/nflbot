@@ -1,6 +1,5 @@
-hyperopt
 numpy
+optuna
 pandas
 prefect
-scipy
 sportsreference
