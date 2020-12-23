@@ -19,6 +19,7 @@ import pendulum
 import prefect
 from prefect import Flow, Parameter, task
 from prefect.schedules import IntervalSchedule
+from prefect.run_configs import LocalRun
 from sportsreference.nfl.schedule import Schedule as NFLSchedule
 from sportsreference.nfl.teams import Teams as NFLTeams
 
@@ -363,8 +364,7 @@ schedule = IntervalSchedule(
     end_date=pendulum.datetime(2021, 2, 3, 8, 0, tz="America/New_York"))
 
 
-# with Flow('deploy nfl model predictions', schedule) as flow:
-with Flow('deploy nfl model predictions') as flow:
+with Flow('deploy nfl model predictions', schedule) as flow:
 
     current_season = Parameter('current_season', default=2020)
     debug = Parameter('debug', default=False)
@@ -383,6 +383,9 @@ with Flow('deploy nfl model predictions') as flow:
 
     forecast(spread_model, total_model, upcoming_games(games), debug=debug)
 
+flow.run_config = LocalRun(
+    working_dir="/home/morelandjs/nflbot")
+
 
 if __name__ == '__main__':
     import argparse
@@ -393,6 +396,6 @@ if __name__ == '__main__':
     args = parser.parse_args()
     kwargs = vars(args)
 
-    # flow.register(project_name='nflbot')
+    flow.register(project_name='nflbot')
 
-    flow.run(current_season=2020, **kwargs)
+    # flow.run(current_season=2020, **kwargs)
