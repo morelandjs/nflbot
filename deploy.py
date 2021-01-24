@@ -153,7 +153,7 @@ def update_database(engine, current_season, debug=False):
     """
     logger = prefect.context.get('logger')
 
- latest_data    latest_data = pd.read_sql(
+    latest_data = pd.read_sql(
         "SELECT DISTINCT season, week FROM games "
         "ORDER BY season DESC, week DESC LIMIT 1",
         engine
@@ -273,7 +273,7 @@ def calibrate_model(games, mode, n_trials=100, debug=False):
       * value
     """
     logger = prefect.context.get('logger')
-    logger.info(f'calibrating {mode} mean parameters')
+    logger.info(f'calibrating {mode} parameters')
 
     def objective(trial):
         """
@@ -300,7 +300,11 @@ def calibrate_model(games, mode, n_trials=100, debug=False):
 
     scale = residuals.std()
 
-    logger.info(f'using scale = {scale}')
+    logger.info(' '.join([
+        f'kfactor = {kfactor}',
+        f'regress_frac = {regress_frac}',
+        f'rest_coeff = {rest_coeff}',
+        f'scale = {scale}']))
 
     return EloraTeam(
         games, mode, kfactor, regress_frac, rest_coeff, scale=scale)
@@ -323,33 +327,9 @@ def train_model(games, mode, n_trials=100):
         'team_home': games.team_home,
         'value': residuals})
 
-    print(comparisons)
-
     model = calibrate_model(comparisons, mode, n_trials=n_trials)
 
     return model
-
-
-@task
-def gamble(games, spread_model, threshold=0.75):
-    """Find profitable bets
-    """
-    games['line_residual'] = spread_model.mean(
-        games.date, games.team_away, games.team_home)
-
-    games = games[games.line_residual.abs() > threshold]
-
-    y_obs = games.score_away - games.score_home
-    y_pred = games.vegas_home_line
-
-    away_cover = (y_obs - y_pred > 0.)
-
-    bet_away = (games.line_residual > 0.)
-
-    success = (away_cover == bet_away)
-
-    print(games.to_string())
-    print(success.sum(axis=0), len(games))
 
 
 @task
@@ -497,13 +477,11 @@ with Flow('deploy nfl model predictions') as flow:
 
     spread_model = train_model(games, 'spread')
 
-    # total_model = train_model(games, 'total')
+    total_model = train_model(games, 'total')
 
-    # gamble(games, spread_model)
+    rank(spread_model, total_model, pd.Timestamp.now(), debug=debug)
 
-    # rank(spread_model, total_model, pd.Timestamp.now(), debug=debug)
-
-    # forecast(spread_model, total_model, debug=debug)
+    forecast(spread_model, total_model, debug=debug)
 
 flow.run_config = LocalRun(
     working_dir="/home/morelandjs/nflbot")

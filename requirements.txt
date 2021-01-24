@@ -1,5 +1,7 @@
+elora @ git+https://github.com/morelandjs/elora.git
 numpy
 optuna
 pandas
 prefect
-sportsreference
+sportsipy
+sqlalchemy
