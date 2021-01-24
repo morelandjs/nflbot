@@ -4,11 +4,11 @@ import operator
 
 from elora import Elora
 import numpy as np
+import pandas as pd
 
 
 class EloraTeam(Elora):
-    """
-    Generate NFL team point-spread or point-total predictions
+    """Generate NFL team point-spread or point-total predictions
     using the Elo regressor algorithm (elora)
     """
     def __init__(self, games, mode, kfactor, regress_frac, rest_coeff,
@@ -62,8 +62,7 @@ class EloraTeam(Elora):
         self.log_loss = -np.log(yp).mean()
 
     def regression_coeff(self, elapsed_time):
-        """
-        Regress ratings to the mean as a function of elapsed time.
+        """Regress ratings to the mean as a function of elapsed time.
 
         Regression fraction equals:
 
@@ -77,25 +76,50 @@ class EloraTeam(Elora):
 
         return np.exp(factor * elapsed_days)
 
+    def compute_rest_days(self, games):
+        """Compute rest days for home and away teams
+        """
+        game_dates = pd.concat([
+            games[["date", "team_home"]].rename(
+                columns={"team_home": "team"}),
+            games[["date", "team_away"]].rename(
+                columns={"team_away": "team"}),
+        ]).sort_values(by="date")
+
+        game_dates['date_prev'] = game_dates.date
+
+        game_dates = pd.merge_asof(
+            game_dates[['team', 'date']],
+            game_dates[['team', 'date', 'date_prev']],
+            on='date', by='team', allow_exact_matches=False)
+
+        for team in ["home", "away"]:
+            game_dates_team = game_dates.rename(columns={
+                'date_prev': f'date_{team}_prev', 'team': f'team_{team}'})
+            games = games.merge(game_dates_team, on=['date', f'team_{team}'])
+
+        one_day = pd.Timedelta("1 days")
+
+        games["rest_days_home"] = np.clip(
+            (games.date - games.date_home_prev) / one_day, 3, 16).fillna(7)
+        games["rest_days_away"] = np.clip(
+            (games.date - games.date_away_prev) / one_day, 3, 16).fillna(7)
+
+        return games.drop(columns=['date_home_prev', 'date_away_prev'])
+
     def bias(self, games):
+        """Circumstantial bias factors which apply to a single game.
         """
-        Circumstantial bias factors which apply to a single game.
-        """
+        games = self.compute_rest_days(games)
+
         rest_adv = self.rest_coeff * self.compare(
             games.rest_days_away, games.rest_days_home)
-
-        # TODO add QB corrections
 
         return rest_adv
 
     def train(self, games):
+        """Trains the Margin Elo (MELO) model on the historical game data.
         """
-        Trains the Margin Elo (MELO) model on the historical game data.
-        """
-        games.sort_values(by=['date', 'team_away', 'team_home'], inplace=True)
-
-        games['value'] = self.compare(games.score_away, games.score_home)
-
         self.fit(
             games.date,
             games.team_away,
@@ -104,8 +128,7 @@ class EloraTeam(Elora):
             biases=self.bias(games))
 
     def rank(self, time, order_by='mean', reverse=False):
-        """
-        Rank labels at specified 'time' according to 'order_by'
+        """Rank labels at specified 'time' according to 'order_by'
         comparison value.
 
         Args:

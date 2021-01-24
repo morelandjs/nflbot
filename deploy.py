@@ -5,12 +5,12 @@ ranking and forecast report for the upcoming week, and post these reports
 to a Slack webhook.
 """
 import datetime
+import itertools
 import json
 import os
 from pathlib import Path
 import requests
-import time
-import urllib
+from urllib.error import HTTPError
 
 import numpy as np
 import optuna
@@ -20,206 +20,268 @@ import prefect
 from prefect import Flow, Parameter, task
 from prefect.schedules import IntervalSchedule
 from prefect.run_configs import LocalRun
-from sportsreference.nfl.schedule import Schedule as NFLSchedule
-from sportsreference.nfl.teams import Teams as NFLTeams
+from sportsipy.nfl.boxscore import Boxscore, Boxscores
+import sqlalchemy
 
 from model import EloraTeam
 
+team_aliases = {
+    'ATL': 'ATL',
+    'BUF': 'BUF',
+    'CAR': 'CAR',
+    'CHI': 'CHI',
+    'CIN': 'CIN',
+    'CLE': 'CLE',
+    'CLT': 'IND',
+    'CRD': 'ARI',
+    'DAL': 'DAL',
+    'DEN': 'DEN',
+    'DET': 'DET',
+    'GNB': 'GB',
+    'HTX': 'HOU',
+    'JAX': 'JAX',
+    'KAN': 'KC',
+    'MIA': 'MIA',
+    'MIN': 'MIN',
+    'NOR': 'NO',
+    'NWE': 'NE',
+    'NYG': 'NYG',
+    'NYJ': 'NYJ',
+    'OTI': 'TEN',
+    'PHI': 'PHI',
+    'PIT': 'PIT',
+    'RAI': 'LV',
+    'RAM': 'LAR',
+    'RAV': 'BAL',
+    'SDG': 'LAC',
+    'SEA': 'SEA',
+    'SFO': 'SF',
+    'TAM': 'TB',
+    'WAS': 'WAS'}
+
 
 @task
-def seasons(current_season):
+def create_engine():
+    """Initialize a sqlite database and create a table with the correct
+    schema if it doesn't already exist. Returns the database connection engine.
     """
-    Return list of available seasons
-    """
-    return [season for season in range(2002, current_season + 1)]
+    db_path = Path.cwd() / 'games.db'
+    engine = sqlalchemy.create_engine(f'sqlite:///{db_path}')
+
+    engine.execute(
+        """CREATE TABLE IF NOT EXISTS games (
+                          gid      TEXT,
+                     datetime  DATETIME,
+                         date      TEXT,
+                       season    BIGINT,
+                         week    BIGINT,
+                     duration      TEXT,
+                   attendance    BIGINT,
+                       winner      TEXT,
+                  losing_name      TEXT,
+                 winning_name      TEXT,
+                  losing_abbr      TEXT,
+                 winning_abbr      TEXT,
+                   over_under      TEXT,
+                   vegas_line      TEXT,
+                         roof      TEXT,
+                      stadium      TEXT,
+                      surface      TEXT,
+                         time      TEXT,
+                      weather      TEXT,
+                     won_toss      TEXT,
+             away_first_downs    BIGINT,
+    away_fourth_down_attempts    BIGINT,
+ away_fourth_down_conversions    BIGINT,
+                 away_fumbles    BIGINT,
+            away_fumbles_lost    BIGINT,
+           away_interceptions    BIGINT,
+          away_net_pass_yards    BIGINT,
+           away_pass_attempts    BIGINT,
+        away_pass_completions    BIGINT,
+         away_pass_touchdowns    BIGINT,
+              away_pass_yards    BIGINT,
+               away_penalties    BIGINT,
+                  away_points    BIGINT,
+           away_rush_attempts    BIGINT,
+         away_rush_touchdowns    BIGINT,
+              away_rush_yards    BIGINT,
+     away_third_down_attempts    BIGINT,
+  away_third_down_conversions    BIGINT,
+      away_time_of_possession      TEXT,
+            away_times_sacked    BIGINT,
+             away_total_yards    BIGINT,
+               away_turnovers    BIGINT,
+    away_yards_from_penalties    BIGINT,
+   away_yards_lost_from_sacks    BIGINT,
+             home_first_downs    BIGINT,
+    home_fourth_down_attempts    BIGINT,
+ home_fourth_down_conversions    BIGINT,
+                 home_fumbles    BIGINT,
+            home_fumbles_lost    BIGINT,
+           home_interceptions    BIGINT,
+          home_net_pass_yards    BIGINT,
+           home_pass_attempts    BIGINT,
+        home_pass_completions    BIGINT,
+         home_pass_touchdowns    BIGINT,
+              home_pass_yards    BIGINT,
+               home_penalties    BIGINT,
+                  home_points    BIGINT,
+           home_rush_attempts    BIGINT,
+         home_rush_touchdowns    BIGINT,
+              home_rush_yards    BIGINT,
+     home_third_down_attempts    BIGINT,
+  home_third_down_conversions    BIGINT,
+      home_time_of_possession      TEXT,
+            home_times_sacked    BIGINT,
+             home_total_yards    BIGINT,
+               home_turnovers    BIGINT,
+    home_yards_from_penalties    BIGINT,
+   home_yards_lost_from_sacks    BIGINT,
+                            UNIQUE(gid))""")
+
+    logger = prefect.context.get('logger')
+    logger.info('successfully connected to database')
+
+    return engine
 
 
 @task
-def team_names():
-    """
-    Get team abbreviation -> team name mapping
-    """
-    return {t.abbreviation: t.name for t in NFLTeams()}
-
-
-@task
-def iter_product(list1, list2):
-    """
-    Compute iterable cross product of list1 and list2
-    """
-    return [(l1, l2) for l1 in list1 for l2 in list2]
-
-
-def get_season_team(season_team, current_season):
-    """
-    Get all game scores for the specified season and team
+def update_database(engine, current_season, debug=False):
+    """Pull box score data for the specified game and store in the
+    SQL database
     """
     logger = prefect.context.get('logger')
 
-    season, team = season_team
+ latest_data    latest_data = pd.read_sql(
+        "SELECT DISTINCT season, week FROM games "
+        "ORDER BY season DESC, week DESC LIMIT 1",
+        engine
+    ).squeeze()
 
-    logger.info(f'syncing {season} {team}')
+    start_season, start_week = latest_data.values
 
-    cachedir = Path('~/.local/share/sportsref/nfl').expanduser()
-    cachedir.mkdir(exist_ok=True, parents=True)
+    seasons = range(start_season, current_season + 1)
+    weeks = range(1, 22)
 
-    cachefile = cachedir / f'{season}_{team}.pkl'
+    for season, week in itertools.product(seasons, weeks):
+        if (season, week) < (start_season, start_week):
+            continue
 
-    if cachefile.exists() and season < current_season:
-        return pd.read_pickle(cachefile)
+        try:
+            boxscores_list = Boxscores(week, season).games.values()
+        except HTTPError:
+            continue
 
-    time.sleep(1)  # rate limit requests
+        for b in itertools.chain.from_iterable(boxscores_list):
+            try:
+                gid = b['boxscore']
+                logger.info(f'syncing {gid}')
 
-    df = NFLSchedule(team, season).dataframe
+                df = Boxscore(gid).dataframe
+                df['gid'] = gid
+                df['season'] = season
+                df['week'] = week
 
-    df['season'] = season
-    df['team_abbr'] = team
+                df.to_sql('games', engine, if_exists='append', index=False)
+            except TypeError:
+                logger.info(f'{gid} data not yet available')
+                continue
+            except sqlalchemy.exc.IntegrityError:
+                logger.info(f'{gid} already stored in database')
+                continue
+
+
+@task
+def modelling_data(engine):
+    """Table of historical NFL boxscore data and betting lines
+    """
+    df = pd.read_sql("""
+    SELECT
+        datetime,
+        season,
+        week,
+        winner,
+        winning_abbr,
+        winning_name,
+        losing_abbr,
+        losing_name,
+        over_under,
+        vegas_line,
+        away_points,
+        home_points
+        FROM games""", engine)
 
     df['team_home'] = np.where(
-        df.location == 'Home', team, df.opponent_abbr)
-    df['team_away'] = np.where(
-        df.location == 'Away', team, df.opponent_abbr)
+        df.winner == 'Home', df.winning_name, df.losing_name)
 
-    df['score_home'] = np.where(
-        df.location == 'Home', df.points_scored, df.points_allowed)
-    df['score_away'] = np.where(
-        df.location == 'Away', df.points_scored, df.points_allowed)
+    df['team_away'] = np.where(
+        df.winner == 'Away', df.winning_name, df.losing_name)
+
+    df['vegas_favorite'] = df.vegas_line.str.replace(
+        'Pick', '0.0').str.split().str[:-1].str.join(' ').str.strip()
+
+    df['vegas_favorite_line'] = df.vegas_line.str.replace(
+       'Pick', '0.0').str.split().str[-1].astype(float)
+
+    df['vegas_home_line'] = np.where(
+        df.vegas_favorite == df.team_home,
+        df.vegas_favorite_line, -df.vegas_favorite_line)
+
+    df['vegas_over_under'] = df.over_under.str.split().str[0].astype(float)
+
+    df['team_home'] = np.where(
+        df.winner == 'Home', df.winning_abbr, df.losing_abbr)
+
+    df['team_away'] = np.where(
+        df.winner == 'Away', df.winning_abbr, df.losing_abbr)
 
     column_aliases = {
         'datetime': 'date',
         'season': 'season',
         'week': 'week',
-        'team_home': 'team_home',
         'team_away': 'team_away',
-        'score_home': 'score_home',
-        'score_away': 'score_away'}
-
-    team_aliases = {
-        'ATL': 'ATL',
-        'BUF': 'BUF',
-        'CAR': 'CAR',
-        'CHI': 'CHI',
-        'CIN': 'CIN',
-        'CLE': 'CLE',
-        'CLT': 'IND',
-        'CRD': 'ARI',
-        'DAL': 'DAL',
-        'DEN': 'DEN',
-        'DET': 'DET',
-        'GNB': 'GB',
-        'HTX': 'HOU',
-        'JAX': 'JAX',
-        'KAN': 'KC',
-        'MIA': 'MIA',
-        'MIN': 'MIN',
-        'NOR': 'NO',
-        'NWE': 'NE',
-        'NYG': 'NYG',
-        'NYJ': 'NYJ',
-        'OTI': 'TEN',
-        'PHI': 'PHI',
-        'PIT': 'PIT',
-        'RAI': 'LV',
-        'RAM': 'LAR',
-        'RAV': 'BAL',
-        'SDG': 'LAC',
-        'SEA': 'SEA',
-        'SFO': 'SF',
-        'TAM': 'TB',
-        'WAS': 'WAS'}
+        'team_home': 'team_home',
+        'away_points': 'score_away',
+        'home_points': 'score_home',
+        'vegas_home_line': 'vegas_home_line',
+        'vegas_over_under': 'vegas_over_under'}
 
     df = df[
         column_aliases.keys()
     ].rename(
-        columns=column_aliases
+        column_aliases, axis=1
     ).replace(
         team_aliases
-    ).drop_duplicates(
-        subset=['date', 'team_home', 'team_away'])
-
-    df.to_pickle(cachefile)
-
-    return df
-
-
-@task
-def concatenate_games(season_team_tuples, current_season):
-    """
-    Concatenate list of dataframes along first axis
-    """
-    def games_gen(season_team_tuples):
-        for season_team in season_team_tuples:
-            try:
-                yield get_season_team(season_team, current_season)
-            except urllib.error.HTTPError:
-                continue
-
-    df_list = [games for games in games_gen(season_team_tuples)]
-
-    df = pd.concat(
-        df_list, axis=0
-    ).drop_duplicates(
-        subset=['date', 'team_home', 'team_away']
+    ).astype(
+        {'date': 'datetime64[s]'}
     ).sort_values(
-        by=['date', 'team_away', 'team_home']
-    ).reset_index(drop=True)
+        by=['date', 'team_away', 'team_home'])
+
+    df.insert(1, 'date_line', df.date - pd.Timedelta(hours=1))
 
     return df
 
 
-@task
-def compute_rest_days(games):
-    """
-    Compute home and away teams days rested
-    """
-    game_dates = pd.concat([
-        games[["date", "team_home"]].rename(
-            columns={"team_home": "team"}),
-        games[["date", "team_away"]].rename(
-            columns={"team_away": "team"}),
-    ]).sort_values(by="date")
-
-    game_dates['date_prev'] = game_dates.date
-
-    game_dates = pd.merge_asof(
-        game_dates[['team', 'date']],
-        game_dates[['team', 'date', 'date_prev']],
-        on='date', by='team', allow_exact_matches=False)
-
-    for team in ["home", "away"]:
-
-        game_dates_team = game_dates.rename(
-            columns={'date_prev': f'date_{team}_prev', 'team': f'team_{team}'})
-
-        games = games.merge(game_dates_team, on=['date', f'team_{team}'])
-
-    one_day = pd.Timedelta("1 days")
-
-    games["rest_days_home"] = np.clip(
-        (games.date - games.date_home_prev) / one_day, 3, 16).fillna(7)
-    games["rest_days_away"] = np.clip(
-        (games.date - games.date_away_prev) / one_day, 3, 16).fillna(7)
-
-    return games
-
-
-@task
 def calibrate_model(games, mode, n_trials=100, debug=False):
-    """
-    Optimizes and returns elora distribution mean parameters.
+    """Optimizes and returns elora distribution mean parameters.
+
+    Games dataframe must have the following columns:
+      * date
+      * team_away
+      * team_home
+      * value
     """
     logger = prefect.context.get('logger')
     logger.info(f'calibrating {mode} mean parameters')
-
-    games = games.dropna(axis=0, how='any').copy()
 
     def objective(trial):
         """
         hyperparameter objective function
         """
-        kfactor = trial.suggest_uniform('kfactor', 0.01, 0.1)
+        kfactor = trial.suggest_loguniform('kfactor', 1e-4, 1e-2)
         regress_frac = trial.suggest_uniform('regress_frac', 0.0, 1.0)
-        rest_coeff = trial.suggest_uniform('rest_coeff', -0.5, 0.5)
+        rest_coeff = trial.suggest_uniform('rest_coeff', -0.2, 0.2)
 
         elora_team = EloraTeam(games, mode, kfactor, regress_frac, rest_coeff)
 
@@ -232,14 +294,62 @@ def calibrate_model(games, mode, n_trials=100, debug=False):
     regress_frac = study.best_params['regress_frac']
     rest_coeff = study.best_params['rest_coeff']
 
-    scale = EloraTeam(
+    residuals = EloraTeam(
         games, mode, kfactor, regress_frac, rest_coeff
-    ).residuals_.std()
+    ).residuals()
+
+    scale = residuals.std()
 
     logger.info(f'using scale = {scale}')
 
     return EloraTeam(
         games, mode, kfactor, regress_frac, rest_coeff, scale=scale)
+
+
+@task
+def train_model(games, mode, n_trials=100):
+    """Time series training data of market predictions
+    """
+    observed, predicted = {
+        'spread': (games.score_away - games.score_home, games.vegas_home_line),
+        'total': (games.score_away + games.score_home, games.vegas_over_under)
+    }[mode]
+
+    residuals = observed - predicted
+
+    comparisons = pd.DataFrame({
+        'date': games.date,
+        'team_away': games.team_away,
+        'team_home': games.team_home,
+        'value': residuals})
+
+    print(comparisons)
+
+    model = calibrate_model(comparisons, mode, n_trials=n_trials)
+
+    return model
+
+
+@task
+def gamble(games, spread_model, threshold=0.75):
+    """Find profitable bets
+    """
+    games['line_residual'] = spread_model.mean(
+        games.date, games.team_away, games.team_home)
+
+    games = games[games.line_residual.abs() > threshold]
+
+    y_obs = games.score_away - games.score_home
+    y_pred = games.vegas_home_line
+
+    away_cover = (y_obs - y_pred > 0.)
+
+    bet_away = (games.line_residual > 0.)
+
+    success = (away_cover == bet_away)
+
+    print(games.to_string())
+    print(success.sum(axis=0), len(games))
 
 
 @task
@@ -279,7 +389,7 @@ def rank(spread_model, total_model, datetime, debug=False):
         '```',
         '*against average team on neutral field'])
 
-    if debug is False:
+    if debug is True:
         requests.post(
             os.getenv('SLACK_WEBHOOK'),
             data=json.dumps({'text': report}),
@@ -288,25 +398,33 @@ def rank(spread_model, total_model, datetime, debug=False):
     print(report)
 
 
+def upcoming_games(season, days=7):
+    """Returns a dataframe of games to be played in the upcoming week
+    """
+    now = datetime.datetime.now()
+
+    for week in range(1, 22):
+        try:
+            boxscores_list = Boxscores(week, season).games.values()
+        except HTTPError:
+            continue
+
+        for b in itertools.chain.from_iterable(boxscores_list):
+            date = datetime.datetime.strptime(b['boxscore'][:8], '%Y%m%d')
+            away = b['away_abbr'].upper()
+            home = b['home_abbr'].upper()
+            if 0 <= (date - now).days <= days:
+                yield (date, season, week, away, home)
+
+
 @task
-def upcoming_games(games, days=7):
+def forecast(spread_model, total_model, debug=False):
+    """Forecast outcomes for the list of games specified.
     """
-    Returns a dataframe of games to be played in the upcoming week
-    """
-    upcoming_games = games[
-        games.score_home.isnull() & games.score_away.isnull()]
+    games = pd.DataFrame(
+        [g for g in upcoming_games(2020)],
+        columns=['date', 'season', 'week', 'team_away', 'team_home'])
 
-    days_ahead = (upcoming_games.date - pd.Timestamp.now()).dt.days
-    upcoming_games = upcoming_games[(0 <= days_ahead) & (days_ahead < days)]
-
-    return upcoming_games.copy()
-
-
-@task
-def forecast(spread_model, total_model, games, debug=False):
-    """
-    Forecast outcomes for the list of games specified.
-    """
     if games.empty:
         logger = prefect.context.get('logger')
         logger.warning('cannot find upcoming game schedule')
@@ -348,7 +466,7 @@ def forecast(spread_model, total_model, games, debug=False):
         report.to_string(index=False),
         '```'])
 
-    if debug is False:
+    if debug is True:
         requests.post(
             os.getenv('SLACK_WEBHOOK'),
             data=json.dumps({'text': report}),
@@ -364,24 +482,28 @@ schedule = IntervalSchedule(
     end_date=pendulum.datetime(2021, 2, 3, 8, 0, tz="America/New_York"))
 
 
-with Flow('deploy nfl model predictions', schedule) as flow:
+# with Flow('deploy nfl model predictions', schedule) as flow:
+with Flow('deploy nfl model predictions') as flow:
 
     current_season = Parameter('current_season', default=2020)
+
     debug = Parameter('debug', default=False)
 
-    season_team_tuples = iter_product(seasons(current_season), team_names)
+    engine = create_engine()
 
-    games = concatenate_games(season_team_tuples, current_season)
+    update_database(engine, current_season, debug=debug)
 
-    games = compute_rest_days(games)
+    games = modelling_data(engine)
 
-    spread_model = calibrate_model(games, 'spread', debug=debug)
+    spread_model = train_model(games, 'spread')
 
-    total_model = calibrate_model(games, 'total', debug=debug)
+    # total_model = train_model(games, 'total')
 
-    rank(spread_model, total_model, pd.Timestamp.now(), debug=debug)
+    # gamble(games, spread_model)
 
-    forecast(spread_model, total_model, upcoming_games(games), debug=debug)
+    # rank(spread_model, total_model, pd.Timestamp.now(), debug=debug)
+
+    # forecast(spread_model, total_model, debug=debug)
 
 flow.run_config = LocalRun(
     working_dir="/home/morelandjs/nflbot")
@@ -396,6 +518,6 @@ if __name__ == '__main__':
     args = parser.parse_args()
     kwargs = vars(args)
 
-    flow.register(project_name='nflbot')
+    # flow.register(project_name='nflbot')
 
-    # flow.run(current_season=2020, **kwargs)
+    flow.run(current_season=2020, **kwargs)
