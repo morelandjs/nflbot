@@ -10,6 +10,10 @@ Install the project requirements with pip::
 
    pip3 install -r requirements.txt
 
-then deploy the prefect workflow::
+then initialize and populte the sqlite games database::
 
-  python3 deploy.py
+  python data
+
+Once the game data is synced, called the predict script: ::
+
+  python predict
