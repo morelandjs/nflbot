@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Trains team model and exposes predictor class objects"""
 from functools import partial
 import operator

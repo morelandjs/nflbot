@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""Source latest NFL game data and store in a sqlite database
-"""
+"""Source latest NFL game data and store in a sqlite database"""
 from datetime import datetime, timedelta
 import itertools
 from pathlib import Path

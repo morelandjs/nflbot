@@ -1,7 +1,7 @@
 NFL Slack Bot
 =============
 
-*Deploys a continually updated NFL prediction model*
+*Deploy NFL predictions to a Slack webhook*
 
 Quick start
 -----------
@@ -12,8 +12,10 @@ Install the project requirements with pip::
 
 then initialize and populte the sqlite games database::
 
-  python data
+  python3 data.py
 
 Once the game data is synced, called the predict script: ::
 
-  python predict
+  python3 predict.py
+
+See ``python3 predict --help`` for details and options!

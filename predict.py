@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+"""Generate NFL predictions using an Elo regressor algorithm (elora)"""
 import json
 import os
 import requests
@@ -103,16 +104,45 @@ def forecast(spread_model, total_model, games, slack_report=False):
 
 
 if __name__ == '__main__':
+    import argparse
     from data import games
+
+    parser = argparse.ArgumentParser(description='NFL prediction model')
+
+    subparsers = parser.add_subparsers(
+        dest='subparser',
+        help='base functionality',
+        required=True)
+
+    rank_p = subparsers.add_parser('rank')
+
+    rank_p.add_argument(
+        '--time', type=pd.Timestamp, default=pd.Timestamp.now(),
+        help='evaluation index time to make predictions; default is now')
+
+    rank_p.add_argument(
+        '--slack-report', help='send predictions to Slack webhook address',
+        action='store_true')
+
+    forecast_p = subparsers.add_parser('forecast')
+
+    forecast_p.add_argument(
+        '--slack-report', help='send predictions to Slack webhook address',
+        action='store_true')
+
+    args = parser.parse_args()
+    kwargs = vars(args)
+    subparser = kwargs.pop('subparser')
 
     spread_model = EloraNFL.from_cache(games, 'spread')
     total_model = EloraNFL.from_cache(games, 'total')
 
-    time = pd.Timestamp.now()
-    slack_report = False
-
-    rank(spread_model, total_model, time,
-         slack_report=slack_report)
-
-    forecast(spread_model, total_model, upcoming_games(days=7),
-             slack_report=slack_report)
+    if subparser == 'rank':
+        rank(spread_model, total_model, args.time,
+             slack_report=args.slack_report)
+    elif subparser == 'forecast':
+        games = upcoming_games(days=7)
+        forecast(spread_model, total_model, games,
+                 slack_report=args.slack_report)
+    else:
+        raise(ValueError, 'No such argument {}'.format(subparser))
