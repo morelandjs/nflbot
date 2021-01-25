@@ -265,15 +265,17 @@ class EloraNFL(Elora):
 if __name__ == '__main__':
     """Minimal example of how to use this module
     """
+    import argparse
     from data import games
 
-    nfl_spread = EloraNFL.from_cache(games, 'spread')
+    parser = argparse.ArgumentParser(description='calibrate hyperparameters')
 
-    rankings = pd.DataFrame(
-        nfl_spread.rank(pd.Timestamp.now()),
-        columns=['team', 'spread_against_average']
-    ).sort_values(
-        by='spread_against_average', ascending=False
-    ).reset_index(drop=True)
+    parser.add_argument(
+        '--steps', type=int, default=100,
+        help='number of Optuna calibration steps')
 
-    print(rankings)
+    args = parser.parse_args()
+
+    EloraNFL.from_cache(games, 'spread', n_trials=args.steps, retrain=True)
+
+    EloraNFL.from_cache(games, 'total', n_trials=args.steps, retrain=True)
